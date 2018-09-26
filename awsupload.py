@@ -1,14 +1,25 @@
 #!/usr/bin/python3
 
+import itertools
+
 import argparse
+import configparser
+import gzip
 import json
 import os
 import subprocess
-import itertools
-import gzip
-import configparser
+from datetime import datetime
+from typing import List
 
 import common
+
+
+class BadPropertiesFiles(BaseException):
+    pass
+
+
+case_sensitive_parser = configparser.RawConfigParser(delimiters=["="])
+case_sensitive_parser.optionxform = lambda option: option
 
 
 def run() -> None:
@@ -17,43 +28,68 @@ def run() -> None:
     local_artifact_root = args.local_artifact_root
     aws_bucket_uri = args.aws_bucket_uri
     dry_mode = args.dry
+    teamcity_feature = args.teamcity_feature
+    skip_old = args.skip_old
 
-    for project in sorted(os.listdir(local_artifact_root)):
-        if project.startswith('_'):
+    for build_result_dir in common.build_results_iter(local_artifact_root):
+        print("{}: Working in {}".format(datetime.now().isoformat(' '), build_result_dir))
+
+        artifacts_json_present = os.path.isfile(os.path.join(build_result_dir, '.teamcity', 'artifacts.json'))
+
+        if skip_old and artifacts_json_present:
+            print("  Found previous artifacts.json file, skipping sync")
             continue
 
-        local_project_dir = os.path.join(local_artifact_root, project)
-        for build_config in sorted(os.listdir(local_project_dir)):
-            local_build_config_dir = os.path.join(local_project_dir, build_config)
+        try:
+            remote_dir = get_remote_path(build_result_dir)
+        except BadPropertiesFiles:
+            # On canceled builds this may not exists but artifacts also are not a concern then
+            print(" Could not find '.teamcity/properties/build.start.properties.gz', this is assumed to be "
+                  "caused by a canceled build")
+            continue
+        remote_uri = aws_bucket_uri + '/' + remote_dir
+        aws_command = ['aws', 's3', 'sync', '--exclude', '.teamcity/*', build_result_dir, remote_uri]
 
-            for build_result in sorted(os.listdir(local_build_config_dir),key=int):
-                build_result_dir = os.path.join(local_build_config_dir,build_result)
+        artifact_list = common.get_artifact_list(build_result_dir)
 
-                # On canceled builds this may not exists but artifacts also are not a concern then
-                properties_file = os.path.join(build_result_dir, '.teamcity/properties/build.start.properties.gz')
-                if not os.path.isfile(properties_file):
-                   print("Could not find property file '{}', "
-                         "this is assumed to be caused by a canceled build".format(properties_file))
-                   continue
-                remote_dir = get_remote_path(properties_file)
-                remote_uri = aws_bucket_uri + '/' + remote_dir
-                aws_command = ['aws', 's3', 'sync', '--exclude', '.teamcity/*', build_result_dir, remote_uri]
-                print('> ' + ' '.join(aws_command))
-                if not dry_mode:
-                  subprocess.run(aws_command)
-                write_json_file(build_result_dir, remote_dir, dry_mode)
+        if len(artifact_list) == 0:
+            print("  No artifacts found".format(build_result_dir))
+            continue
+        if dry_mode:
+            print("  Not running '{}'".format(aws_command))
+        else:
+            print('  > ' + ' '.join(aws_command))
+            subprocess.run(aws_command)
+
+        if artifacts_json_present:
+            print("  Found previous artifacts.json file, I will not overwrite it!".format(build_result_dir))
+            continue
+        write_json_file(artifact_list, build_result_dir, remote_dir, teamcity_feature, dry_mode)
 
 
-def get_remote_path(properties_file: str) -> str:
+def get_remote_path(build_result_dir: str) -> str:
+    # Sometimes one of the properties files is bad (empty or too short). In those cases try the other one before giving
+    # up
+    start_prop_file = os.path.join(build_result_dir, '.teamcity/properties/build.start.properties.gz')
+    finish_prop_file = os.path.join(build_result_dir, '.teamcity/properties/build.finish.properties.gz')
+    minimum_file_size_bytes = 100  # Consider files that are smaller than this invalid
+    if os.path.isfile(start_prop_file) and os.path.getsize(start_prop_file) > minimum_file_size_bytes:
+        properties_file = start_prop_file
+    elif os.path.isfile(finish_prop_file) and os.path.getsize(finish_prop_file) > minimum_file_size_bytes:
+        properties_file = finish_prop_file
+    else:
+        raise BadPropertiesFiles("No sane looking properties file found in {}".format(build_result_dir))
 
     with gzip.open(properties_file, mode='rt', encoding="utf8") as fh:
-        config = configparser.ConfigParser()
-        config.read_file(f=itertools.chain(['[global]'], fh))
-        build_number = config['global']['teamcity.build.id']
-        build_id = config['global']['system.teamcity.buildtype.id']
-        project_id = config['global']['teamcity.project.id']
+        case_sensitive_parser.read_file(f=itertools.chain(['[global]'], fh))
+        all_parameters = case_sensitive_parser['global']
 
-    return '{project_id}/{build_id}/{build_number}/'.format(project_id=project_id, build_id=build_id, build_number=build_number)
+        build_number = all_parameters['teamcity.build.id']
+        build_id = all_parameters['system.teamcity.buildType.id']
+        project_id = all_parameters['teamcity.project.id']
+
+    return '{project_id}/{build_id}/{build_number}/'.format(project_id=project_id, build_id=build_id,
+                                                            build_number=build_number)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,19 +98,20 @@ def parse_args() -> argparse.Namespace:
     common.add_local_artifact_root_argument(parser)
     common.add_aws_bucket_uri_argument(parser)
     common.add_dry_mode_argument(parser)
+    common.add_teamcity_feature_argument(parser)
+    common.add_skip_old_argument(parser)
 
     return parser.parse_args()
 
 
-def write_json_file(build_result_dir: str, remote_dir: str, dry_run: bool) -> None:
-    artifacts = [os.path.join(build_result_dir, entry) for entry in os.listdir(build_result_dir) if entry != '.teamcity']
-
+def write_json_file(artifacts: List[str], build_result_dir: str, remote_dir: str, teamcity_feature: str,
+                    dry_run: bool) -> None:
     artifact_objects = []
-    for artifact in artifacts:
-        assert os.path.isfile(artifact), 'Expected {0} to be a file but was not'.format(artifact)
+    for full_path in artifacts:
+        relative_path = os.path.relpath(full_path, start=build_result_dir)
         artifact_objects.append({
-            "path": os.path.basename(artifact),
-            "size": os.stat(artifact).st_size,
+            "path": relative_path,
+            "size": os.path.getsize(full_path),
             "properties": {}
         })
 
@@ -83,14 +120,14 @@ def write_json_file(build_result_dir: str, remote_dir: str, dry_run: bool) -> No
             "version": "2017.1",
             # FIXME: This is probably specific to Linux... someone might want to add flexibility someday for Windows
             #        support if this is wrong
-            "storage_settings_id": "PROJECT_EXT_4",
+            "storage_settings_id": teamcity_feature,
             "properties": {
                 "s3_path_prefix": remote_dir
             },
             "artifacts": artifact_objects
         }
         artifacts_json_file_path = os.path.join(build_result_dir, '.teamcity', 'artifacts.json')
-        print('Writing ' + artifacts_json_file_path)
+        print('  Writing .teamcity/artifacts.json')
         json_string = json.dumps(the_json, indent=2)
         if dry_run:
             print(json_string)
